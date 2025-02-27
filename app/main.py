@@ -1,19 +1,46 @@
 import asyncio
 import logging
+import os
 import random
+from contextlib import asynccontextmanager
 
+import asyncpg
 import requests
-from fastapi import FastAPI
-from fastapi import HTTPException, status
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException, status
 from opentelemetry import trace
+from opentelemetry.instrumentation.asyncpg import AsyncPGInstrumentor
 from opentelemetry.trace.status import Status, StatusCode
 
+load_dotenv()
+
+DB_USER = os.getenv("DB_USER")
+DB_PASSWORD = os.getenv("DB_PASSWORD")
+DB_NAME = os.getenv("DB_NAME")
+DB_HOST = os.getenv("DB_HOST")
+DB_PORT = os.getenv("DB_PORT")
+
 random.seed(54321)
+
+trace_provider = trace.get_tracer_provider()
+tracer = trace_provider.get_tracer(__name__)
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-app = FastAPI()
+DB_POOL = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global DB_POOL
+    DB_POOL = await asyncpg.create_pool(user=DB_USER, password=DB_PASSWORD, database=DB_NAME,
+                                        host=DB_HOST, port=DB_PORT)
+    AsyncPGInstrumentor().instrument(tracer_provider=trace_provider)
+    yield
+    await DB_POOL.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.get("/")
@@ -66,3 +93,23 @@ def external_api():
     response = requests.get(f"https://httpbin.org/delay/{seconds}")
     response.close()
     return "ok"
+
+
+@app.post("/insert-data")
+async def insert_data(name: str):
+    try:
+        async with DB_POOL.acquire() as conn:
+            async with conn.transaction():
+                query = "INSERT INTO users (name) VALUES ($1) RETURNING id"
+                user_id = await conn.fetchval(query, name)
+
+                with tracer.start_as_current_span("db-insert") as span:
+                    span.set_attribute("db.system", "postgresql")
+                    span.set_attribute("db.operation", "INSERT")
+                    span.set_attribute("db.table", "users")
+                    span.set_attribute("inserted.id", user_id)
+
+                return {"message": "Data inserted", "id": user_id}
+    except Exception as e:
+        logger.error(e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Database error")
